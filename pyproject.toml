@@ -1,0 +1,37 @@
+[project]
+name = "bandcamp-plex-sync"
+version = "0.1.0"
+description = "Audit a Bandcamp collection against a Plex music library and download missing purchased FLAC albums."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Christopher Patti" }]
+keywords = ["bandcamp", "plex", "music", "flac"]
+dependencies = [
+  "browser-cookie3>=0.20.1",
+  "cyclopts>=3.0.0",
+  "mutagen>=1.47.0",
+  "requests>=2.32.0",
+  "rich>=13.7.0",
+]
+
+[dependency-groups]
+dev = [
+  "mypy>=1.16.0",
+  "pre-commit>=4.0.0",
+  "ruff>=0.11.0",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true

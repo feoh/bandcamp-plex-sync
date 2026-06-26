@@ -1,0 +1,239 @@
+# bandcamp-plex-sync
+
+`bandcamp-plex-sync` helps keep a purchased Bandcamp collection in sync with a
+local Plex music library.
+
+It can:
+
+- Fetch your Bandcamp fan collection.
+- Scan a Plex-style local music tree such as `/nas/music`.
+- Report albums/tracks that appear to be missing locally.
+- Download missing **purchased FLAC** files from Bandcamp.
+- Extract Bandcamp album ZIPs into Plex-friendly `Artist/Album/` directories.
+
+The tool is intentionally conservative: it never deletes existing music and it
+dry-runs downloads unless you pass `--yes`.
+
+## Requirements
+
+- Linux/macOS with Python 3.11+
+- [`uv`](https://docs.astral.sh/uv/) installed
+- A browser where you are logged in to Bandcamp
+- A local Plex music directory, defaulting to `/nas/music`
+
+Bandcamp purchased FLAC downloads require authentication. The tool reads
+Bandcamp cookies from your browser with `browser-cookie3`; no Bandcamp password
+is stored by this tool.
+
+## Installation
+
+Clone the repo and run the script through `uv`:
+
+```bash
+git clone git@github.com:feoh/bandcamp-plex-sync.git
+cd bandcamp-plex-sync
+uv run python bin/bandcamp-plex-sync --help
+```
+
+Optional: put it on your PATH:
+
+```bash
+install -Dm755 bin/bandcamp-plex-sync ~/.local/bin/bandcamp-plex-sync
+# or, if ~/bin is on your PATH:
+install -Dm755 bin/bandcamp-plex-sync ~/bin/bandcamp-plex-sync
+```
+
+The script also contains inline `uv` dependency metadata, so it can be executed
+directly:
+
+```bash
+./bin/bandcamp-plex-sync --help
+```
+
+## Quick start
+
+Run an authenticated audit, then download missing FLAC albums/tracks:
+
+```bash
+bandcamp-plex-sync audit YOUR_BANDCAMP_USERNAME --cookies-from-browser
+bandcamp-plex-sync download-missing --yes
+```
+
+For the original use case:
+
+```bash
+bandcamp-plex-sync audit feoh --cookies-from-browser
+bandcamp-plex-sync download-missing --yes
+```
+
+By default, files are written under `/nas/music`.
+
+## Commands
+
+### `audit`
+
+Fetches your Bandcamp collection, scans the local music directory, compares both,
+and writes reports.
+
+```bash
+bandcamp-plex-sync audit USER --cookies-from-browser
+```
+
+Useful options:
+
+```bash
+bandcamp-plex-sync audit USER \
+  --music-root /nas/music \
+  --output-dir ~/.cache/bandcamp-plex-sync \
+  --cookies-from-browser \
+  --include-hidden
+```
+
+Outputs:
+
+```text
+~/.cache/bandcamp-plex-sync/
+  bandcamp-collection.json   # fetched Bandcamp collection metadata
+  local-scan.json            # scanned local audio metadata
+  sync-report.json           # machine-readable comparison
+  sync-report.md             # human-readable report
+  missing-urls.txt           # Bandcamp item pages for missing items
+  missing.csv                # spreadsheet-friendly missing item list
+```
+
+### `download-missing`
+
+Downloads missing purchased items from `sync-report.json`.
+
+```bash
+bandcamp-plex-sync download-missing --yes
+```
+
+FLAC is the default:
+
+```bash
+bandcamp-plex-sync download-missing --download-format flac --yes
+```
+
+Safety/testing options:
+
+```bash
+# Dry run; shows what would download
+bandcamp-plex-sync download-missing
+
+# Test with one item
+bandcamp-plex-sync download-missing --limit 1 --yes
+
+# Write somewhere other than /nas/music
+bandcamp-plex-sync download-missing --destination ./downloads --yes
+
+# Keep Bandcamp ZIP archives after extraction
+bandcamp-plex-sync download-missing --keep-archives --yes
+
+# Replace existing files
+bandcamp-plex-sync download-missing --overwrite --yes
+```
+
+Downloaded album ZIPs are extracted into:
+
+```text
+/nas/music/Artist/Album/
+```
+
+Single-track FLAC downloads are written similarly:
+
+```text
+/nas/music/Artist/Track Title/Artist - Track Title.flac
+```
+
+### `fetch`
+
+Only fetch Bandcamp metadata:
+
+```bash
+bandcamp-plex-sync fetch USER --cookies-from-browser
+```
+
+### `scan`
+
+Only scan local music metadata:
+
+```bash
+bandcamp-plex-sync scan --music-root /nas/music
+```
+
+### `compare`
+
+Compare previously fetched/scanned JSON files:
+
+```bash
+bandcamp-plex-sync compare
+```
+
+## Authentication and browser cookies
+
+Use `--cookies-from-browser` for both `audit` and `download-missing` when you
+want purchased downloads.
+
+Supported browser cookie stores are tried in this order:
+
+1. Firefox
+2. LibreWolf
+3. Chrome
+4. Chromium
+5. Brave
+6. Vivaldi
+7. Edge
+8. Opera
+
+If cookies fail to load:
+
+- Make sure you are logged in to Bandcamp in one of those browsers.
+- Close the browser if its cookie database is locked.
+- Try running the command from the same desktop user account as the browser.
+
+## Matching behavior
+
+The audit compares normalized artist, album, and track metadata. It uses local
+audio tags when present and falls back to Plex-style paths:
+
+```text
+Artist/Album/Track.ext
+```
+
+The report distinguishes:
+
+- `matched`: confident local match
+- `possible`: fuzzy match worth reviewing
+- `missing`: no good local match found
+
+You can tune fuzzy matching with:
+
+```bash
+bandcamp-plex-sync audit USER --threshold 0.90
+```
+
+Higher thresholds produce fewer possible matches.
+
+## Privacy and safety
+
+- The tool does not store your Bandcamp password.
+- Authenticated Bandcamp redownload URLs are saved in
+  `bandcamp-collection.json` and `sync-report.json`; treat these files as
+  private.
+- Existing music is skipped by default.
+- Nothing is downloaded unless `download-missing --yes` is used.
+- Nothing is deleted from your Plex library.
+
+## Development
+
+```bash
+uv sync
+uv run python -m py_compile bin/bandcamp-plex-sync
+uv run pre-commit run --all-files
+uv run mypy bin/bandcamp-plex-sync
+```
+
+## License
+
+MIT

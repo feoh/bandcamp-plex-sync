@@ -1,0 +1,11 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.13
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^bin/bandcamp-plex-sync$
+        types_or: [file]
+      - id: ruff-format
+        files: ^bin/bandcamp-plex-sync$
+        types_or: [file]
