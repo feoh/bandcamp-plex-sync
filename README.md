@@ -6,7 +6,8 @@ local Plex music library.
 It can:
 
 - Fetch your Bandcamp fan collection.
-- Scan a Plex-style local music tree such as `/nas/music`.
+- Incrementally scan a Plex-style local music tree such as `/nas/music`.
+- Cache scanned tags in SQLite so unchanged audio files are not reopened each run.
 - Report albums/tracks that appear to be missing locally.
 - Download missing **purchased FLAC** files from Bandcamp.
 - Extract Bandcamp album ZIPs into Plex-friendly `Artist/Album/` directories.
@@ -94,7 +95,8 @@ Outputs:
 ```text
 ~/.cache/bandcamp-plex-sync/
   bandcamp-collection.json   # fetched Bandcamp collection metadata
-  local-scan.json            # scanned local audio metadata
+  local-scan.json            # scanned local audio metadata and incremental scan stats
+  music-scan.sqlite3         # persistent file signatures and cached tag metadata
   sync-report.json           # machine-readable comparison
   sync-report.md             # human-readable report
   missing-urls.txt           # Bandcamp item pages for missing items
@@ -156,11 +158,31 @@ bandcamp-plex-sync fetch USER --cookies-from-browser
 
 ### `scan`
 
-Only scan local music metadata:
+Incrementally scan local music metadata:
 
 ```bash
 bandcamp-plex-sync scan --music-root /nas/music
 ```
+
+The first run reads tags from every audio file and records the file size,
+nanosecond modification/change times, device, and inode in
+`~/.cache/bandcamp-plex-sync/music-scan.sqlite3`. Later runs still walk the
+filesystem to detect additions, modifications, renames, and deletions, but they
+reuse cached tags for unchanged files instead of opening and parsing every audio
+file. This makes repeat scans much faster while retaining change detection.
+
+The `scan` and `audit` commands both support:
+
+```bash
+# Put the checkpoint database somewhere else
+bandcamp-plex-sync scan --checkpoint-db /path/to/music-checkpoints.sqlite3
+
+# Ignore cached signatures and refresh every track's metadata
+bandcamp-plex-sync scan --rescan-all
+```
+
+When `--output` or `--output-dir` is changed without an explicit
+`--checkpoint-db`, the database is placed alongside the JSON output.
 
 ### `compare`
 
@@ -222,6 +244,8 @@ Higher thresholds produce fewer possible matches.
   `bandcamp-collection.json` and `sync-report.json`; treat these files as
   private.
 - Existing music is skipped by default.
+- The local SQLite checkpoint database contains file paths and music tags, but
+  no Bandcamp credentials or browser cookies.
 - Nothing is downloaded unless `download-missing --yes` is used.
 - Nothing is deleted from your Plex library.
 

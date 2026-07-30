@@ -23,6 +23,7 @@ import html
 import json
 import os
 import re
+import sqlite3
 import sys
 import unicodedata
 import zipfile
@@ -48,6 +49,7 @@ err_console = Console(stderr=True)
 
 CACHE_DIR = Path("~/.cache/bandcamp-plex-sync").expanduser()
 DEFAULT_MUSIC_ROOT = Path("/nas/music")
+DEFAULT_CHECKPOINT_DB = CACHE_DIR / "music-scan.sqlite3"
 AUDIO_EXTENSIONS = {
     ".aac",
     ".aif",
@@ -95,6 +97,21 @@ class MatchCandidate:
     artist: str
     album: str
     title: str
+
+
+@dataclass(frozen=True)
+class ScanStats:
+    audio_files: int
+    metadata_scanned: int
+    metadata_reused: int
+    removed: int
+    complete: bool
+
+
+@dataclass(frozen=True)
+class MusicScan:
+    tracks: list[LocalTrack]
+    stats: ScanStats
 
 
 def now_iso() -> str:
@@ -188,27 +205,211 @@ def track_from_file(path: Path, root: Path) -> LocalTrack | None:
     )
 
 
-def should_skip_dir(path: Path) -> bool:
-    return any(part in SKIP_DIRS for part in path.parts)
+def open_checkpoint_database(path: Path) -> sqlite3.Connection:
+    path = path.expanduser()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=30)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode = WAL")
+    connection.execute("PRAGMA busy_timeout = 30000")
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS music_file_checkpoints (
+            root TEXT NOT NULL,
+            path TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime_ns INTEGER NOT NULL,
+            ctime_ns INTEGER NOT NULL,
+            device INTEGER NOT NULL,
+            inode INTEGER NOT NULL,
+            artist TEXT NOT NULL,
+            albumartist TEXT NOT NULL,
+            album TEXT NOT NULL,
+            title TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (root, path)
+        )
+        """
+    )
+    connection.commit()
+    return connection
 
 
-def scan_music_tree(root: Path, max_files: int | None = None) -> list[LocalTrack]:
-    tracks: list[LocalTrack] = []
-    seen_audio = 0
-    for path in root.rglob("*"):
-        if should_skip_dir(path):
-            continue
-        if not path.is_file() or path.suffix.lower() not in AUDIO_EXTENSIONS:
-            continue
-        seen_audio += 1
-        if max_files is not None and seen_audio > max_files:
-            break
-        track = track_from_file(path, root)
-        if track:
-            tracks.append(track)
-        if seen_audio % 1000 == 0:
-            err_console.print(f"Scanned {seen_audio} audio files...")
-    return tracks
+def cached_track(row: sqlite3.Row) -> LocalTrack:
+    return LocalTrack(
+        path=str(row["path"]),
+        artist=str(row["artist"]),
+        albumartist=str(row["albumartist"]),
+        album=str(row["album"]),
+        title=str(row["title"]),
+    )
+
+
+def file_signature(stat_result: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        stat_result.st_size,
+        stat_result.st_mtime_ns,
+        stat_result.st_ctime_ns,
+        stat_result.st_dev,
+        stat_result.st_ino,
+    )
+
+
+def checkpoint_matches(row: sqlite3.Row, signature: tuple[int, int, int, int, int]) -> bool:
+    return signature == (
+        row["size"],
+        row["mtime_ns"],
+        row["ctime_ns"],
+        row["device"],
+        row["inode"],
+    )
+
+
+def scan_music_tree(
+    root: Path,
+    max_files: int | None = None,
+    *,
+    checkpoint_db: Path = DEFAULT_CHECKPOINT_DB,
+    rescan_all: bool = False,
+) -> MusicScan:
+    """Incrementally scan audio metadata, reusing unchanged SQLite checkpoints."""
+    root = root.expanduser().absolute()
+    if not root.is_dir():
+        raise RuntimeError(f"Music root is not a readable directory: {root}")
+
+    root_key = str(root)
+    connection = open_checkpoint_database(checkpoint_db)
+    try:
+        cached_rows = {
+            str(row["path"]): row
+            for row in connection.execute(
+                "SELECT * FROM music_file_checkpoints WHERE root = ?", (root_key,)
+            )
+        }
+
+        tracks: list[LocalTrack] = []
+        seen_paths: set[str] = set()
+        updates: list[tuple[LocalTrack, tuple[int, int, int, int, int]]] = []
+        metadata_scanned = 0
+        metadata_reused = 0
+        processed_audio = 0
+        limit_reached = False
+        scan_errors: list[OSError] = []
+
+        def record_walk_error(error: OSError) -> None:
+            scan_errors.append(error)
+            err_console.print(f"[yellow]Could not scan directory:[/] {error}")
+
+        for directory, dirnames, filenames in os.walk(root, onerror=record_walk_error):
+            dirnames[:] = sorted(name for name in dirnames if name not in SKIP_DIRS)
+            for filename in sorted(filenames):
+                path = Path(directory, filename)
+                if path.suffix.lower() not in AUDIO_EXTENSIONS:
+                    continue
+                if max_files is not None and processed_audio >= max_files:
+                    limit_reached = True
+                    break
+
+                try:
+                    signature = file_signature(path.stat())
+                except OSError as exc:
+                    scan_errors.append(exc)
+                    err_console.print(f"[yellow]Could not stat audio file:[/] {path}: {exc}")
+                    continue
+
+                path_key = str(path)
+                seen_paths.add(path_key)
+                processed_audio += 1
+                row = None if rescan_all else cached_rows.get(path_key)
+                if row is not None and checkpoint_matches(row, signature):
+                    tracks.append(cached_track(row))
+                    metadata_reused += 1
+                else:
+                    track = track_from_file(path, root)
+                    metadata_scanned += 1
+                    if track:
+                        tracks.append(track)
+                        try:
+                            final_signature = file_signature(path.stat())
+                        except OSError as exc:
+                            final_signature = None
+                            err_console.print(
+                                f"[yellow]Could not verify audio file:[/] {path}: {exc}"
+                            )
+                        if final_signature == signature:
+                            updates.append((track, signature))
+                        elif final_signature is not None:
+                            err_console.print(
+                                f"[yellow]Audio file changed during scan; "
+                                f"checkpoint deferred:[/] {path}"
+                            )
+
+                if processed_audio % 1000 == 0:
+                    err_console.print(
+                        f"Checked {processed_audio} audio files "
+                        f"({metadata_scanned} new or changed)..."
+                    )
+            if limit_reached:
+                break
+
+        if scan_errors and not limit_reached:
+            for path_key in sorted(set(cached_rows) - seen_paths):
+                tracks.append(cached_track(cached_rows[path_key]))
+                metadata_reused += 1
+
+        complete = not limit_reached and not scan_errors
+        stale_paths = set(cached_rows) - seen_paths if complete else set()
+        updated_at = now_iso()
+        with connection:
+            connection.executemany(
+                """
+                INSERT INTO music_file_checkpoints (
+                    root, path, size, mtime_ns, ctime_ns, device, inode,
+                    artist, albumartist, album, title, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(root, path) DO UPDATE SET
+                    size = excluded.size,
+                    mtime_ns = excluded.mtime_ns,
+                    ctime_ns = excluded.ctime_ns,
+                    device = excluded.device,
+                    inode = excluded.inode,
+                    artist = excluded.artist,
+                    albumartist = excluded.albumartist,
+                    album = excluded.album,
+                    title = excluded.title,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    (
+                        root_key,
+                        track.path,
+                        *signature,
+                        track.artist,
+                        track.albumartist,
+                        track.album,
+                        track.title,
+                        updated_at,
+                    )
+                    for track, signature in updates
+                ),
+            )
+            connection.executemany(
+                "DELETE FROM music_file_checkpoints WHERE root = ? AND path = ?",
+                ((root_key, path) for path in stale_paths),
+            )
+
+        return MusicScan(
+            tracks=tracks,
+            stats=ScanStats(
+                audio_files=processed_audio,
+                metadata_scanned=metadata_scanned,
+                metadata_reused=metadata_reused,
+                removed=len(stale_paths),
+                complete=complete,
+            ),
+        )
+    finally:
+        connection.close()
 
 
 def redownload_url_for_item(
@@ -878,17 +1079,32 @@ def fetch(
 def scan(
     music_root: Path = DEFAULT_MUSIC_ROOT,
     output: Path = CACHE_DIR / "local-scan.json",
+    checkpoint_db: Path | None = None,
     max_files: int | None = None,
+    rescan_all: bool = False,
 ) -> None:
-    """Scan local Plex music files and write tag/path metadata to JSON."""
-    tracks = scan_music_tree(music_root, max_files=max_files)
+    """Incrementally scan local Plex music metadata and write it to JSON."""
+    checkpoint_db = checkpoint_db or output.parent / DEFAULT_CHECKPOINT_DB.name
+    music_scan = scan_music_tree(
+        music_root,
+        max_files=max_files,
+        checkpoint_db=checkpoint_db,
+        rescan_all=rescan_all,
+    )
     payload = {
         "scanned_at": now_iso(),
-        "root": str(music_root),
-        "tracks": [asdict(track) for track in tracks],
+        "root": str(music_root.expanduser().absolute()),
+        "checkpoint_db": str(checkpoint_db.expanduser().absolute()),
+        "scan_stats": asdict(music_scan.stats),
+        "tracks": [asdict(track) for track in music_scan.tracks],
     }
     write_json(output, payload)
-    console.print(f"Wrote {len(tracks)} local tracks to {output}")
+    stats = music_scan.stats
+    console.print(
+        f"Wrote {len(music_scan.tracks)} local tracks to {output} "
+        f"([green]{stats.metadata_reused} cached[/], "
+        f"[yellow]{stats.metadata_scanned} new or changed[/], {stats.removed} removed)"
+    )
 
 
 @app.command
@@ -991,11 +1207,13 @@ def audit(
     user: str = "",
     music_root: Path = DEFAULT_MUSIC_ROOT,
     output_dir: Path = CACHE_DIR,
+    checkpoint_db: Path | None = None,
     cookies_from_browser: bool = False,
     include_hidden: bool = False,
     threshold: float = 0.86,
     limit: int | None = None,
     max_files: int | None = None,
+    rescan_all: bool = False,
 ) -> None:
     """Fetch Bandcamp, scan Plex music, compare, and write reports."""
     user = user or os.environ.get("BANDCAMP_USER", "")
@@ -1013,13 +1231,26 @@ def audit(
     write_json(output_dir / "bandcamp-collection.json", collection)
 
     console.print(f"Scanning local music under [bold]{music_root}[/]...")
-    tracks = scan_music_tree(music_root, max_files=max_files)
+    checkpoint_db = checkpoint_db or output_dir / DEFAULT_CHECKPOINT_DB.name
+    music_scan = scan_music_tree(
+        music_root,
+        max_files=max_files,
+        checkpoint_db=checkpoint_db,
+        rescan_all=rescan_all,
+    )
     local_scan = {
         "scanned_at": now_iso(),
-        "root": str(music_root),
-        "tracks": [asdict(track) for track in tracks],
+        "root": str(music_root.expanduser().absolute()),
+        "checkpoint_db": str(checkpoint_db.expanduser().absolute()),
+        "scan_stats": asdict(music_scan.stats),
+        "tracks": [asdict(track) for track in music_scan.tracks],
     }
     write_json(output_dir / "local-scan.json", local_scan)
+    stats = music_scan.stats
+    console.print(
+        f"Music metadata: [green]{stats.metadata_reused} cached[/], "
+        f"[yellow]{stats.metadata_scanned} new or changed[/], {stats.removed} removed"
+    )
 
     report = compare_payloads(collection, local_scan, threshold=threshold)
     write_outputs(output_dir, report)
