@@ -28,24 +28,24 @@ is stored by this tool.
 
 ## Installation
 
-Clone the repo and run the script through `uv`:
+Install the published command with `uv`:
+
+```bash
+uv tool install bandcamp-plex-sync
+bandcamp-plex-sync --help
+```
+
+To run from a source checkout:
 
 ```bash
 git clone git@github.com:feoh/bandcamp-plex-sync.git
 cd bandcamp-plex-sync
-uv run python bin/bandcamp-plex-sync --help
+uv sync
+uv run bandcamp-plex-sync --help
 ```
 
-Optional: put it on your PATH:
-
-```bash
-install -Dm755 bin/bandcamp-plex-sync ~/.local/bin/bandcamp-plex-sync
-# or, if ~/bin is on your PATH:
-install -Dm755 bin/bandcamp-plex-sync ~/bin/bandcamp-plex-sync
-```
-
-The script also contains inline `uv` dependency metadata, so it can be executed
-directly:
+The checkout also retains a development wrapper with inline `uv` dependency
+metadata:
 
 ```bash
 ./bin/bandcamp-plex-sync --help
@@ -148,6 +148,19 @@ Single-track FLAC downloads are written similarly:
 /nas/music/Artist/Track Title/Artist - Track Title.flac
 ```
 
+### `auth-check`
+
+Verify that one of the supported browser profiles is logged in to the account
+that owns the requested collection and that Bandcamp exposes protected download
+URLs:
+
+```bash
+bandcamp-plex-sync auth-check USER
+```
+
+This is a diagnostic check only. It does not create a persistent login or store
+browser cookies.
+
 ### `fetch`
 
 Only fetch Bandcamp metadata:
@@ -194,8 +207,18 @@ bandcamp-plex-sync compare
 
 ## Authentication and browser cookies
 
-Use `--cookies-from-browser` for both `audit` and `download-missing` when you
-want purchased downloads.
+Use `--cookies-from-browser` with `fetch` or `audit` when you want purchased
+download URLs. `download-missing` uses browser authentication by default because
+opening Bandcamp's protected download pages requires it. Authentication is
+command-scoped; no login session is persisted between invocations.
+
+Use `auth-check USER` to diagnose authentication independently before running an
+audit or download.
+
+Every discovered profile in each supported browser is checked, rather than only
+the browser's default profile. The tool verifies that the selected session owns
+the requested Bandcamp collection before accepting its cookies; this prevents an
+anonymous or wrong-profile session from silently producing empty download URLs.
 
 Supported browser cookie stores are tried in this order:
 
@@ -213,6 +236,11 @@ If cookies fail to load:
 - Make sure you are logged in to Bandcamp in one of those browsers.
 - Close the browser if its cookie database is locked.
 - Try running the command from the same desktop user account as the browser.
+- Confirm the username passed to `audit` is the collection owned by the logged-in
+  Bandcamp account.
+
+Bandcamp subscription collection entries are not individually downloadable.
+Their album and track releases appear as separate downloadable collection items.
 
 ## Matching behavior
 
@@ -253,9 +281,11 @@ Higher thresholds produce fewer possible matches.
 
 ```bash
 uv sync
-uv run python -m py_compile bin/bandcamp-plex-sync
+uv run python -m compileall -q src tests
 uv run pre-commit run --all-files
-uv run mypy bin/bandcamp-plex-sync
+uv run mypy src/bandcamp_plex_sync
+uv run python -m unittest discover -s tests -v
+uv build
 ```
 
 ## License

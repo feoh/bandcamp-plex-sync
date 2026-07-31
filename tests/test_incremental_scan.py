@@ -1,21 +1,100 @@
 from __future__ import annotations
 
-import importlib.machinery
-import importlib.util
 import sqlite3
-import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).parents[1] / "bin" / "bandcamp-plex-sync"
-LOADER = importlib.machinery.SourceFileLoader("bandcamp_plex_sync", str(SCRIPT))
-SPEC = importlib.util.spec_from_loader(LOADER.name, LOADER)
-assert SPEC is not None
-MODULE = importlib.util.module_from_spec(SPEC)
-sys.modules[SPEC.name] = MODULE
-LOADER.exec_module(MODULE)
+from requests.cookies import cookiejar_from_dict
+
+from bandcamp_plex_sync import cli as MODULE
+
+
+class BrowserCookieSessionTests(unittest.TestCase):
+    def test_authenticated_session_requires_collection_username(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "requires a collection username"):
+            MODULE.configure_session(True)
+
+    def test_auth_check_reports_authenticated_download_access(self) -> None:
+        session = MODULE.new_bandcamp_session()
+        page_data = {
+            "collection_data": {
+                "item_count": 42,
+                "redownload_urls": {"one": "protected", "two": "protected"},
+            },
+            "item_cache": {
+                "collection": {
+                    "one": {"download_available": True},
+                    "two": {"download_available": True},
+                }
+            },
+        }
+        with (
+            patch.object(MODULE, "configure_session", return_value=session) as configure,
+            patch.object(MODULE, "pagedata_from_profile", return_value=page_data),
+            patch.object(MODULE.console, "print") as print_message,
+        ):
+            MODULE.auth_check("listener")
+
+        configure.assert_called_once_with(True, "listener")
+        output = " ".join(str(call.args[0]) for call in print_message.call_args_list)
+        self.assertIn("Authenticated browser session found", output)
+        self.assertIn("Collection items: 42", output)
+        self.assertIn("initial batch: 2", output)
+
+    def test_finds_cookie_databases_in_every_browser_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            home = Path(temporary_directory)
+            default = home / ".config/vivaldi/Default/Cookies"
+            profile = home / ".config/vivaldi/Profile 1/Cookies"
+            default.parent.mkdir(parents=True)
+            profile.parent.mkdir(parents=True)
+            default.touch()
+            profile.touch()
+
+            self.assertEqual(MODULE.browser_cookie_files("vivaldi", home), [default, profile])
+
+    def test_selects_profile_that_owns_requested_collection(self) -> None:
+        cookie_files = [Path("Default/Cookies"), Path("Profile 1/Cookies")]
+
+        def load_cookies(*, domain_name: str, cookie_file: str):
+            self.assertEqual(domain_name, ".bandcamp.com")
+            profile = Path(cookie_file).parent.name
+            return cookiejar_from_dict({"browser_profile": profile})
+
+        def profile_page(session, _user: str):
+            return {
+                "fan_data": {"is_own_page": session.cookies.get("browser_profile") == "Profile 1"}
+            }
+
+        fake_browser_cookie3 = SimpleNamespace(vivaldi=load_cookies)
+        with (
+            patch.object(MODULE, "browser_cookie3", fake_browser_cookie3),
+            patch.object(MODULE, "BROWSER_COOKIE_PATTERNS", {"vivaldi": ()}),
+            patch.object(MODULE, "browser_cookie_files", return_value=cookie_files),
+            patch.object(MODULE, "pagedata_from_profile", side_effect=profile_page),
+        ):
+            session = MODULE.configure_session(True, "listener")
+
+        self.assertEqual(session.cookies.get("browser_profile"), "Profile 1")
+
+    def test_rejects_browser_cookies_that_are_not_authenticated(self) -> None:
+        cookie_jar = cookiejar_from_dict({"client_id": "anonymous"})
+        fake_browser_cookie3 = SimpleNamespace(vivaldi=lambda **_kwargs: cookie_jar)
+        with (
+            patch.object(MODULE, "browser_cookie3", fake_browser_cookie3),
+            patch.object(MODULE, "BROWSER_COOKIE_PATTERNS", {"vivaldi": ()}),
+            patch.object(MODULE, "browser_cookie_files", return_value=[None]),
+            patch.object(
+                MODULE,
+                "pagedata_from_profile",
+                return_value={"fan_data": {"is_own_page": False}},
+            ),
+            self.assertRaisesRegex(RuntimeError, "authenticated Bandcamp cookies"),
+        ):
+            MODULE.configure_session(True, "listener")
 
 
 class IncrementalMusicScanTests(unittest.TestCase):

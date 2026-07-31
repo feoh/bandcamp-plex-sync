@@ -1,0 +1,78 @@
+---
+name: Publish release
+
+on:
+  release:
+    types: [published]
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build and validate distributions
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@d0d8abe699bfb85fec6de9f7adb5ae17292296ff
+        with:
+          enable-cache: false
+
+      - name: Verify release tag matches package version
+        run: |
+          package_version="$(
+            uv run --no-project python <<'PY'
+          import tomllib
+
+          with open("pyproject.toml", "rb") as project_file:
+              print(tomllib.load(project_file)["project"]["version"])
+          PY
+          )"
+          test "v${package_version}" = "${GITHUB_REF_NAME}"
+
+      - name: Install project
+        run: uv sync --locked
+
+      - name: Run quality checks
+        run: |
+          uv run pre-commit run --all-files
+          uv run mypy src/bandcamp_plex_sync
+          uv run python -m unittest discover -s tests -v
+
+      - name: Build distributions
+        run: uv build
+
+      - name: Upload distributions
+        uses: >-
+          actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: python-distributions
+          path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/bandcamp-plex-sync/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download distributions
+        uses: >-
+          actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: python-distributions
+          path: dist/
+
+      - name: Publish distributions to PyPI
+        uses: >-
+          pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33

@@ -1,12 +1,29 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
 [project]
 name = "bandcamp-plex-sync"
-version = "0.1.0"
+version = "0.2.0"
 description = "Audit a Bandcamp collection against a Plex music library and download missing purchased FLAC albums."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [{ name = "Christopher Patti" }]
 keywords = ["bandcamp", "plex", "music", "flac"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Multimedia :: Sound/Audio",
+]
 dependencies = [
   "browser-cookie3>=0.20.1",
   "cyclopts>=3.0.0",
@@ -14,6 +31,14 @@ dependencies = [
   "requests>=2.32.0",
   "rich>=13.7.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/feoh/bandcamp-plex-sync"
+Repository = "https://github.com/feoh/bandcamp-plex-sync"
+Issues = "https://github.com/feoh/bandcamp-plex-sync/issues"
+
+[project.scripts]
+bandcamp-plex-sync = "bandcamp_plex_sync.cli:main"
 
 [dependency-groups]
 dev = [
@@ -35,3 +60,9 @@ python_version = "3.11"
 ignore_missing_imports = true
 check_untyped_defs = true
 warn_unused_ignores = true
+
+[tool.pyright]
+include = ["src", "tests"]
+venvPath = "."
+venv = ".venv"
+pythonVersion = "3.11"
