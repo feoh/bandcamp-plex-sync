@@ -15,8 +15,8 @@ from __future__ import annotations
 
 import importlib
 import sys
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 
 def load_main() -> Callable[[], None]:
