@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "bandcamp-plex-sync"
-version = "0.2.0"
+version = "0.2.1"
 description = "Audit a Bandcamp collection against a Plex music library and download missing purchased FLAC albums."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -41,11 +41,7 @@ Issues = "https://github.com/feoh/bandcamp-plex-sync/issues"
 bandcamp-plex-sync = "bandcamp_plex_sync.cli:main"
 
 [dependency-groups]
-dev = [
-  "mypy>=1.16.0",
-  "pre-commit>=4.0.0",
-  "ruff>=0.11.0",
-]
+dev = ["mypy>=1.16.0", "pre-commit>=4.0.0", "ruff>=0.11.0"]
 
 [tool.ruff]
 line-length = 100

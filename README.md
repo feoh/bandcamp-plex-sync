@@ -105,10 +105,18 @@ Outputs:
 
 ### `download-missing`
 
-Downloads missing purchased items from `sync-report.json`.
+Downloads missing purchased items from `sync-report.json`. When `--yes` is
+provided, the command uses the current browser session to refresh protected
+Bandcamp download URLs automatically; another audit is not required.
 
 ```bash
 bandcamp-plex-sync download-missing --yes
+```
+
+Older or custom reports without `bandcamp_user` can provide it explicitly:
+
+```bash
+bandcamp-plex-sync download-missing --user USER --yes
 ```
 
 FLAC is the default:
@@ -209,8 +217,8 @@ bandcamp-plex-sync compare
 
 Use `--cookies-from-browser` with `fetch` or `audit` when you want purchased
 download URLs. `download-missing` uses browser authentication by default because
-opening Bandcamp's protected download pages requires it. Authentication is
-command-scoped; no login session is persisted between invocations.
+it refreshes and opens Bandcamp's protected download pages itself. Authentication
+is command-scoped; no login session is persisted between invocations.
 
 Use `auth-check USER` to diagnose authentication independently before running an
 audit or download.
@@ -236,8 +244,7 @@ If cookies fail to load:
 - Make sure you are logged in to Bandcamp in one of those browsers.
 - Close the browser if its cookie database is locked.
 - Try running the command from the same desktop user account as the browser.
-- Confirm the username passed to `audit` is the collection owned by the logged-in
-  Bandcamp account.
+- Confirm the collection username is owned by the logged-in Bandcamp account.
 
 Bandcamp subscription collection entries are not individually downloadable.
 Their album and track releases appear as separate downloadable collection items.

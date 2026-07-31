@@ -97,6 +97,56 @@ class BrowserCookieSessionTests(unittest.TestCase):
             MODULE.configure_session(True, "listener")
 
 
+class DownloadMissingTests(unittest.TestCase):
+    @staticmethod
+    def report_item() -> dict[str, object]:
+        return {
+            "artist": "Artist",
+            "title": "Album",
+            "item_type": "album",
+            "item_id": 123,
+            "url": "https://artist.bandcamp.com/album/example",
+            "download_available": True,
+            "redownload_url": None,
+        }
+
+    def test_dry_run_says_download_will_refresh_urls_without_audit(self) -> None:
+        report = {"bandcamp_user": "listener", "missing": [self.report_item()]}
+        with (
+            patch.object(MODULE, "load_json", return_value=report),
+            patch.object(MODULE.console, "print") as print_message,
+        ):
+            MODULE.download_missing(report_json=Path("report.json"))
+
+        output = " ".join(str(call.args[0]) for call in print_message.call_args_list)
+        self.assertIn("refreshed automatically", output)
+        self.assertNotIn("audit", output.lower())
+
+    def test_download_refreshes_and_persists_protected_urls(self) -> None:
+        report_item = self.report_item()
+        report = {"bandcamp_user": "listener", "missing": [report_item]}
+        fresh_item = dict(report_item) | {"redownload_url": "https://bandcamp.com/download/token"}
+        collection = {"fetched_at": "2026-07-31T00:00:00Z", "items": [fresh_item]}
+        session = MODULE.new_bandcamp_session()
+        report_path = Path("report.json")
+
+        with (
+            patch.object(MODULE, "load_json", return_value=report),
+            patch.object(MODULE, "configure_session", return_value=session) as configure,
+            patch.object(MODULE, "fetch_collection_items", return_value=collection) as fetch,
+            patch.object(MODULE, "write_json") as write,
+            patch.object(MODULE, "download_purchased_bandcamp_item", return_value=[]) as download,
+            patch.object(MODULE.console, "print"),
+        ):
+            MODULE.download_missing(report_json=report_path, yes=True)
+
+        configure.assert_called_once_with(True, "listener")
+        fetch.assert_called_once_with("listener", session=session)
+        write.assert_called_once_with(report_path, report)
+        self.assertEqual(report_item["redownload_url"], fresh_item["redownload_url"])
+        download.assert_called_once()
+
+
 class IncrementalMusicScanTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()

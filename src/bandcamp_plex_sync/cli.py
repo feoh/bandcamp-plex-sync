@@ -575,7 +575,7 @@ def configure_session(cookies_from_browser: bool, user: str | None = None) -> Se
     if not user:
         raise RuntimeError(
             "Authenticated Bandcamp access requires a collection username. "
-            "Re-run `bandcamp-plex-sync audit <user> --cookies-from-browser`."
+            "Provide USER, pass --user, or set BANDCAMP_USER."
         )
 
     errors: list[str] = []
@@ -632,8 +632,9 @@ def fetch_collection_items(
     cookies_from_browser: bool = False,
     include_hidden: bool = False,
     limit: int | None = None,
+    session: Session | None = None,
 ) -> dict[str, Any]:
-    session = configure_session(cookies_from_browser, user)
+    session = session or configure_session(cookies_from_browser, user)
     page_data = pagedata_from_profile(session, user)
     fan_data = page_data.get("fan_data") or {}
     collection_data = page_data.get("collection_data") or {}
@@ -682,6 +683,38 @@ def fetch_collection_items(
         "source": "bandcamp.com/fancollection",
         "items": [asdict(item) for item in deduped.values()],
     }
+
+
+def bandcamp_item_keys(item: dict[str, Any]) -> list[tuple[str, str, str]]:
+    keys: list[tuple[str, str, str]] = []
+    item_type = str(item.get("item_type") or "")
+    item_id = item.get("item_id")
+    if item_type and item_id is not None:
+        keys.append(("item", item_type, str(item_id)))
+    url = str(item.get("url") or "").rstrip("/")
+    if url:
+        keys.append(("url", "", url))
+    return keys
+
+
+def refresh_report_download_urls(report: dict[str, Any], collection: dict[str, Any]) -> int:
+    """Merge fresh protected download URLs into an existing comparison report."""
+    lookup = {key: item for item in collection.get("items", []) for key in bandcamp_item_keys(item)}
+    refreshed = 0
+    for section in ("matched", "possible", "missing"):
+        for item in report.get(section, []):
+            fresh = next(
+                (lookup[key] for key in bandcamp_item_keys(item) if key in lookup),
+                None,
+            )
+            if fresh is None:
+                continue
+            item["download_available"] = fresh.get("download_available")
+            item["redownload_url"] = fresh.get("redownload_url")
+            if item["redownload_url"]:
+                refreshed += 1
+    report["download_urls_refreshed_at"] = collection.get("fetched_at") or now_iso()
+    return refreshed
 
 
 def build_local_indexes(
@@ -1007,8 +1040,8 @@ def download_purchased_bandcamp_item(
     redownload_url = item.get("redownload_url")
     if not redownload_url:
         raise RuntimeError(
-            "No purchased-download URL in report. Re-run `bandcamp-plex-sync audit "
-            "<user> --cookies-from-browser` first."
+            "No purchased-download URL is available for this item. Run `download-missing` "
+            "with browser authentication enabled so it can refresh protected URLs."
         )
 
     response = session.get(str(redownload_url), timeout=30)
@@ -1258,6 +1291,7 @@ def compare(
 @app.command
 def download_missing(
     report_json: Path = CACHE_DIR / "sync-report.json",
+    user: str = "",
     destination: Path = DEFAULT_MUSIC_ROOT,
     cookies_from_browser: bool = True,
     yes: bool = False,
@@ -1268,10 +1302,21 @@ def download_missing(
 ) -> None:
     """Download report's missing purchased items into the Plex music directory.
 
-    Downloads full-quality Bandcamp purchased files, FLAC by default. Run
-    `audit --cookies-from-browser` first; pass --yes to actually write files.
+    Protected download URLs are refreshed from the current browser session before
+    writing files. Pass --yes to actually download files.
     """
     report = load_json(report_json)
+    user = user or str(report.get("bandcamp_user") or "") or os.environ.get("BANDCAMP_USER", "")
+    session: Session | None = None
+
+    if yes and cookies_from_browser:
+        console.print("Refreshing authenticated Bandcamp download URLs...")
+        session = configure_session(True, user)
+        collection = fetch_collection_items(user, session=session)
+        refreshed = refresh_report_download_urls(report, collection)
+        write_json(report_json, report)
+        console.print(f"Refreshed {refreshed} protected download URL(s) in {report_json}")
+
     missing = [item for item in report.get("missing", []) if item.get("url")]
     if limit is not None:
         missing = missing[:limit]
@@ -1292,10 +1337,15 @@ def download_missing(
     console.print(f"Found {len(missing)} missing item(s). Destination: [bold]{destination}[/]")
     console.print(f"Download format: [bold]{download_format}[/]")
     if missing_redownload:
+        if cookies_from_browser:
+            guidance = "They will be refreshed automatically when downloading with --yes."
+            if not user:
+                guidance = "Pass --user USER or set BANDCAMP_USER when downloading with --yes."
+        else:
+            guidance = "Enable --cookies-from-browser to refresh them before downloading."
         console.print(
             f"[yellow]{len(missing_redownload)} downloadable item(s) lack authenticated "
-            "download URLs.[/] Re-run `bandcamp-plex-sync audit <user> "
-            "--cookies-from-browser` to fetch them."
+            f"download URLs.[/] {guidance}"
         )
     if not_individually_downloadable:
         console.print(
@@ -1306,7 +1356,7 @@ def download_missing(
         if item.get("redownload_url"):
             marker = "✓"
         elif bool(item.get("download_available")):
-            marker = "missing authenticated download URL"
+            marker = "authenticated URL will be refreshed"
         else:
             marker = "not individually downloadable"
         console.print(f"- {item['artist']} — {item['title']}  [dim]{marker}  {item['url']}[/]")
@@ -1319,7 +1369,7 @@ def download_missing(
     if not with_redownload:
         raise SystemExit(2)
 
-    session = configure_session(cookies_from_browser, report.get("bandcamp_user"))
+    session = session or configure_session(cookies_from_browser, user or None)
     downloaded_count = 0
     failed: list[tuple[dict[str, Any], str]] = []
     for item in with_redownload:
