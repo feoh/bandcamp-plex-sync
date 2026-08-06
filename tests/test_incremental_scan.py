@@ -5,11 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from requests.cookies import cookiejar_from_dict
 
-from bandcamp_plex_sync import cli as MODULE
+import bandcamp_plex_sync.cli as MODULE
 
 
 class BrowserCookieSessionTests(unittest.TestCase):
@@ -97,7 +98,7 @@ class BrowserCookieSessionTests(unittest.TestCase):
             MODULE.configure_session(True, "listener")
 
 
-class DownloadMissingTests(unittest.TestCase):
+class SyncTests(unittest.TestCase):
     @staticmethod
     def report_item() -> dict[str, object]:
         return {
@@ -110,41 +111,103 @@ class DownloadMissingTests(unittest.TestCase):
             "redownload_url": None,
         }
 
-    def test_dry_run_says_download_will_refresh_urls_without_audit(self) -> None:
+    @staticmethod
+    def sync_result(
+        report: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+        return {"items": []}, {"tracks": []}, report
+
+    def test_dry_run_refreshes_website_and_library_comparison(self) -> None:
         report = {"bandcamp_user": "listener", "missing": [self.report_item()]}
+        session = MODULE.new_bandcamp_session()
         with (
-            patch.object(MODULE, "load_json", return_value=report),
+            patch.object(MODULE, "configure_session", return_value=session) as configure,
+            patch.object(
+                MODULE, "build_current_sync_report", return_value=self.sync_result(report)
+            ) as build,
+            patch.object(MODULE, "write_json"),
             patch.object(MODULE.console, "print") as print_message,
         ):
-            MODULE.download_missing(report_json=Path("report.json"))
+            MODULE.sync(report_json=Path("report.json"), user="listener")
 
+        configure.assert_called_once_with(True, "listener")
+        build.assert_called_once()
         output = " ".join(str(call.args[0]) for call in print_message.call_args_list)
-        self.assertIn("refreshed automatically", output)
-        self.assertNotIn("audit", output.lower())
+        self.assertIn("Dry run only", output)
 
-    def test_download_refreshes_and_persists_protected_urls(self) -> None:
-        report_item = self.report_item()
-        report = {"bandcamp_user": "listener", "missing": [report_item]}
-        fresh_item = dict(report_item) | {"redownload_url": "https://bandcamp.com/download/token"}
-        collection = {"fetched_at": "2026-07-31T00:00:00Z", "items": [fresh_item]}
+    def test_download_persists_completed_item_from_fresh_comparison(self) -> None:
+        report_item = self.report_item() | {"redownload_url": "https://bandcamp.com/download/token"}
+        report: dict[str, Any] = {
+            "bandcamp_user": "listener",
+            "counts": {"missing": 1},
+            "missing": [report_item],
+        }
         session = MODULE.new_bandcamp_session()
         report_path = Path("report.json")
 
         with (
-            patch.object(MODULE, "load_json", return_value=report),
             patch.object(MODULE, "configure_session", return_value=session) as configure,
-            patch.object(MODULE, "fetch_collection_items", return_value=collection) as fetch,
+            patch.object(
+                MODULE, "build_current_sync_report", return_value=self.sync_result(report)
+            ) as build,
             patch.object(MODULE, "write_json") as write,
-            patch.object(MODULE, "download_purchased_bandcamp_item", return_value=[]) as download,
+            patch.object(
+                MODULE,
+                "download_purchased_bandcamp_item",
+                return_value=[Path("downloads/Artist/Album/track.flac")],
+            ) as download,
             patch.object(MODULE.console, "print"),
         ):
-            MODULE.download_missing(report_json=report_path, yes=True)
+            MODULE.sync(report_json=report_path, user="listener", yes=True)
 
         configure.assert_called_once_with(True, "listener")
-        fetch.assert_called_once_with("listener", session=session)
-        write.assert_called_once_with(report_path, report)
-        self.assertEqual(report_item["redownload_url"], fresh_item["redownload_url"])
+        build.assert_called_once()
+        self.assertEqual(write.call_count, 4)
+        write.assert_called_with(report_path, report)
         download.assert_called_once()
+        self.assertEqual(report["missing"], [])
+        self.assertEqual(report["counts"], {"missing": 0, "completed": 1})
+        self.assertEqual(report["completed"][0]["status"], "completed")
+        self.assertEqual(report["completed"][0]["download_format"], "flac")
+        self.assertEqual(len(report["completed"][0]["downloaded_files"]), 1)
+
+    def test_fresh_comparison_with_no_missing_items_does_not_download(self) -> None:
+        report: dict[str, Any] = {
+            "bandcamp_user": "listener",
+            "counts": {"missing": 0},
+            "missing": [],
+        }
+        with (
+            patch.object(MODULE, "configure_session", return_value=MODULE.new_bandcamp_session()),
+            patch.object(
+                MODULE, "build_current_sync_report", return_value=self.sync_result(report)
+            ) as build,
+            patch.object(MODULE, "write_json"),
+            patch.object(MODULE, "download_purchased_bandcamp_item") as download,
+            patch.object(MODULE.console, "print") as print_message,
+        ):
+            MODULE.sync(report_json=Path("report.json"), user="listener", yes=True)
+
+        build.assert_called_once()
+        download.assert_not_called()
+        output = " ".join(str(call.args[0]) for call in print_message.call_args_list)
+        self.assertIn("No missing downloadable Bandcamp URLs", output)
+
+    def test_non_downloadable_items_are_not_an_error(self) -> None:
+        item = self.report_item() | {"download_available": False}
+        report = {"bandcamp_user": "listener", "missing": [item]}
+        with (
+            patch.object(MODULE, "configure_session", return_value=MODULE.new_bandcamp_session()),
+            patch.object(
+                MODULE, "build_current_sync_report", return_value=self.sync_result(report)
+            ),
+            patch.object(MODULE, "write_json"),
+            patch.object(MODULE.console, "print") as print_message,
+        ):
+            MODULE.sync(report_json=Path("report.json"), user="listener", yes=True)
+
+        output = " ".join(str(call.args[0]) for call in print_message.call_args_list)
+        self.assertIn("No individually downloadable missing items remain", output)
 
 
 class IncrementalMusicScanTests(unittest.TestCase):

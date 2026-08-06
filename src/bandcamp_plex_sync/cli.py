@@ -1,8 +1,8 @@
-"""Audit a Bandcamp fan collection against a Plex music directory.
+"""Synchronize a Bandcamp fan collection with a Plex music directory.
 
 This intentionally does not delete or move existing music. It fetches your
-Bandcamp collection, scans your Plex music tree, writes a missing-items report,
-and can download purchased FLAC files for the gaps.
+Bandcamp collection, incrementally scans your Plex music tree, reports gaps,
+and can download missing purchased FLAC files.
 """
 
 from __future__ import annotations
@@ -31,9 +31,8 @@ from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3NoHeaderError
 from requests import Session
 from rich.console import Console
-from rich.table import Table
 
-app = cyclopts.App(help="Keep a Bandcamp collection audited against a Plex music library.")
+app = cyclopts.App(help="Synchronize a Bandcamp collection with a Plex music library.")
 console = Console()
 err_console = Console(stderr=True)
 
@@ -697,24 +696,51 @@ def bandcamp_item_keys(item: dict[str, Any]) -> list[tuple[str, str, str]]:
     return keys
 
 
-def refresh_report_download_urls(report: dict[str, Any], collection: dict[str, Any]) -> int:
-    """Merge fresh protected download URLs into an existing comparison report."""
-    lookup = {key: item for item in collection.get("items", []) for key in bandcamp_item_keys(item)}
-    refreshed = 0
-    for section in ("matched", "possible", "missing"):
-        for item in report.get(section, []):
-            fresh = next(
-                (lookup[key] for key in bandcamp_item_keys(item) if key in lookup),
-                None,
-            )
-            if fresh is None:
-                continue
-            item["download_available"] = fresh.get("download_available")
-            item["redownload_url"] = fresh.get("redownload_url")
-            if item["redownload_url"]:
-                refreshed += 1
-    report["download_urls_refreshed_at"] = collection.get("fetched_at") or now_iso()
-    return refreshed
+def record_completed_download(
+    report: dict[str, Any],
+    item: dict[str, Any],
+    paths: list[Path],
+    *,
+    destination: Path,
+    download_format: str,
+) -> None:
+    """Move a successfully downloaded or verified item out of the missing queue."""
+    missing = report.get("missing", [])
+    report["missing"] = [candidate for candidate in missing if candidate is not item]
+
+    completed_item = dict(item)
+    completed_item.update(
+        {
+            "status": "completed",
+            "completed_at": now_iso(),
+            "download_destination": str(destination.expanduser().absolute()),
+            "download_format": download_format,
+            "downloaded_files": [str(path.expanduser().absolute()) for path in paths],
+        }
+    )
+    item_keys = set(bandcamp_item_keys(item))
+    completed = [
+        candidate
+        for candidate in report.get("completed", [])
+        if not item_keys.intersection(bandcamp_item_keys(candidate))
+    ]
+    completed.append(completed_item)
+    report["completed"] = completed
+    report["download_progress_updated_at"] = completed_item["completed_at"]
+
+    counts = report.setdefault("counts", {})
+    counts["missing"] = len(report["missing"])
+    counts["completed"] = len(completed)
+
+
+def persist_download_report(report_json: Path, report: dict[str, Any]) -> None:
+    """Persist download progress and keep standard report artifacts consistent."""
+    write_json(report_json, report)
+    if report_json.name != "sync-report.json":
+        return
+    write_markdown_report(report_json.with_suffix(".md"), report)
+    write_missing_urls(report_json.parent / "missing-urls.txt", report)
+    write_missing_csv(report_json.parent / "missing.csv", report)
 
 
 def build_local_indexes(
@@ -840,6 +866,7 @@ def write_markdown_report(path: Path, report: dict[str, Any]) -> None:
         f"- Matched: {counts['matched']}",
         f"- Possible matches to review: {counts['possible']}",
         f"- Missing: {counts['missing']}",
+        *([f"- Completed downloads: {counts['completed']}"] if counts.get("completed") else []),
         "",
         "## Missing from Plex",
         "",
@@ -1040,8 +1067,8 @@ def download_purchased_bandcamp_item(
     redownload_url = item.get("redownload_url")
     if not redownload_url:
         raise RuntimeError(
-            "No purchased-download URL is available for this item. Run `download-missing` "
-            "with browser authentication enabled so it can refresh protected URLs."
+            "No purchased-download URL is available for this item. Run `sync` with "
+            "browser authentication enabled."
         )
 
     response = session.get(str(redownload_url), timeout=30)
@@ -1164,27 +1191,46 @@ def download_bandcamp_item_streams(
     return downloaded
 
 
-def print_summary(report: dict[str, Any]) -> None:
-    counts = report["counts"]
-    table = Table(title="Bandcamp ↔ Plex sync audit")
-    table.add_column("Metric")
-    table.add_column("Count", justify="right")
-    for key, label in [
-        ("bandcamp_items", "Bandcamp items"),
-        ("local_tracks", "Local tracks"),
-        ("matched", "Matched"),
-        ("possible", "Possible"),
-        ("missing", "Missing"),
-    ]:
-        table.add_row(label, str(counts[key]))
-    console.print(table)
+def build_current_sync_report(
+    user: str,
+    music_root: Path,
+    *,
+    checkpoint_db: Path,
+    cookies_from_browser: bool,
+    include_hidden: bool,
+    threshold: float,
+    session: Session | None = None,
+    rescan_all: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """Fetch Bandcamp and incrementally compare it with the current music library."""
+    console.print(f"Fetching Bandcamp collection for [bold]{user}[/]...")
+    collection = fetch_collection_items(
+        user,
+        cookies_from_browser=cookies_from_browser,
+        include_hidden=include_hidden,
+        session=session,
+    )
 
-    if report.get("missing"):
-        console.print("\n[bold red]Missing items:[/]")
-        for item in report["missing"][:20]:
-            console.print(f"- {item['artist']} — {item['title']}  [dim]{item.get('url', '')}[/]")
-        if len(report["missing"]) > 20:
-            console.print(f"[dim]...and {len(report['missing']) - 20} more in the report.[/]")
+    console.print(f"Scanning local music under [bold]{music_root}[/]...")
+    music_scan = scan_music_tree(
+        music_root,
+        checkpoint_db=checkpoint_db,
+        rescan_all=rescan_all,
+    )
+    local_scan = {
+        "scanned_at": now_iso(),
+        "root": str(music_root.expanduser().absolute()),
+        "checkpoint_db": str(checkpoint_db.expanduser().absolute()),
+        "scan_stats": asdict(music_scan.stats),
+        "tracks": [asdict(track) for track in music_scan.tracks],
+    }
+    stats = music_scan.stats
+    console.print(
+        f"Music metadata: [green]{stats.metadata_reused} cached[/], "
+        f"[yellow]{stats.metadata_scanned} new or changed[/], {stats.removed} removed"
+    )
+    report = compare_payloads(collection, local_scan, threshold=threshold)
+    return collection, local_scan, report
 
 
 @app.command
@@ -1217,112 +1263,59 @@ def auth_check(user: str = "") -> None:
 
 
 @app.command
-def fetch(
-    user: str = "",
-    output: Path = CACHE_DIR / "bandcamp-collection.json",
-    cookies_from_browser: bool = False,
-    include_hidden: bool = False,
-    limit: int | None = None,
-) -> None:
-    """Fetch a Bandcamp fan collection to JSON."""
-    user = user or os.environ.get("BANDCAMP_USER", "")
-    if not user:
-        console.print("[red]Provide USER or set BANDCAMP_USER.[/]")
-        raise SystemExit(2)
-    payload = fetch_collection_items(
-        user,
-        cookies_from_browser=cookies_from_browser,
-        include_hidden=include_hidden,
-        limit=limit,
-    )
-    write_json(output, payload)
-    console.print(f"Wrote {len(payload['items'])} Bandcamp items to {output}")
-
-
-@app.command
-def scan(
-    music_root: Path = DEFAULT_MUSIC_ROOT,
-    output: Path = CACHE_DIR / "local-scan.json",
-    checkpoint_db: Path | None = None,
-    max_files: int | None = None,
-    rescan_all: bool = False,
-) -> None:
-    """Incrementally scan local Plex music metadata and write it to JSON."""
-    checkpoint_db = checkpoint_db or output.parent / DEFAULT_CHECKPOINT_DB.name
-    music_scan = scan_music_tree(
-        music_root,
-        max_files=max_files,
-        checkpoint_db=checkpoint_db,
-        rescan_all=rescan_all,
-    )
-    payload = {
-        "scanned_at": now_iso(),
-        "root": str(music_root.expanduser().absolute()),
-        "checkpoint_db": str(checkpoint_db.expanduser().absolute()),
-        "scan_stats": asdict(music_scan.stats),
-        "tracks": [asdict(track) for track in music_scan.tracks],
-    }
-    write_json(output, payload)
-    stats = music_scan.stats
-    console.print(
-        f"Wrote {len(music_scan.tracks)} local tracks to {output} "
-        f"([green]{stats.metadata_reused} cached[/], "
-        f"[yellow]{stats.metadata_scanned} new or changed[/], {stats.removed} removed)"
-    )
-
-
-@app.command
-def compare(
-    collection_json: Path = CACHE_DIR / "bandcamp-collection.json",
-    local_json: Path = CACHE_DIR / "local-scan.json",
-    output_dir: Path = CACHE_DIR,
-    threshold: float = 0.86,
-) -> None:
-    """Compare previously fetched/scanned JSON files and write reports."""
-    report = compare_payloads(
-        load_json(collection_json),
-        load_json(local_json),
-        threshold=threshold,
-    )
-    write_outputs(output_dir, report)
-    print_summary(report)
-
-
-@app.command
-def download_missing(
+def sync(
     report_json: Path = CACHE_DIR / "sync-report.json",
     user: str = "",
     destination: Path = DEFAULT_MUSIC_ROOT,
+    checkpoint_db: Path | None = None,
     cookies_from_browser: bool = True,
+    include_hidden: bool = False,
+    threshold: float = 0.86,
+    rescan_all: bool = False,
     yes: bool = False,
     overwrite: bool = False,
     limit: int | None = None,
     download_format: str = "flac",
     keep_archives: bool = False,
 ) -> None:
-    """Download report's missing purchased items into the Plex music directory.
+    """Find and download purchased Bandcamp items missing from the music library.
 
-    Protected download URLs are refreshed from the current browser session before
-    writing files. Pass --yes to actually download files.
+    This is the one-step sync command: it fetches the current Bandcamp collection,
+    incrementally scans local music, writes a fresh comparison report, and downloads
+    the missing items when --yes is supplied.
     """
-    report = load_json(report_json)
-    user = user or str(report.get("bandcamp_user") or "") or os.environ.get("BANDCAMP_USER", "")
-    session: Session | None = None
+    previous_report = load_json(report_json) if report_json.is_file() else {}
+    user = (
+        user
+        or str(previous_report.get("bandcamp_user") or "")
+        or os.environ.get("BANDCAMP_USER", "")
+    )
+    if not user:
+        console.print("[red]Provide USER, pass --user, or set BANDCAMP_USER.[/]")
+        raise SystemExit(2)
 
-    if yes and cookies_from_browser:
-        console.print("Refreshing authenticated Bandcamp download URLs...")
-        session = configure_session(True, user)
-        collection = fetch_collection_items(user, session=session)
-        refreshed = refresh_report_download_urls(report, collection)
-        write_json(report_json, report)
-        console.print(f"Refreshed {refreshed} protected download URL(s) in {report_json}")
+    session = configure_session(cookies_from_browser, user if cookies_from_browser else None)
+    checkpoint_db = checkpoint_db or report_json.parent / DEFAULT_CHECKPOINT_DB.name
+    collection, local_scan, report = build_current_sync_report(
+        user,
+        destination,
+        checkpoint_db=checkpoint_db,
+        cookies_from_browser=cookies_from_browser,
+        include_hidden=include_hidden,
+        threshold=threshold,
+        session=session,
+        rescan_all=rescan_all,
+    )
+    write_json(report_json.parent / "bandcamp-collection.json", collection)
+    write_json(report_json.parent / "local-scan.json", local_scan)
+    persist_download_report(report_json, report)
 
     missing = [item for item in report.get("missing", []) if item.get("url")]
     if limit is not None:
         missing = missing[:limit]
 
     if not missing:
-        console.print("No missing downloadable Bandcamp URLs found in the report.")
+        console.print("No missing downloadable Bandcamp URLs found.")
         return
 
     with_redownload = [item for item in missing if item.get("redownload_url")]
@@ -1338,11 +1331,9 @@ def download_missing(
     console.print(f"Download format: [bold]{download_format}[/]")
     if missing_redownload:
         if cookies_from_browser:
-            guidance = "They will be refreshed automatically when downloading with --yes."
-            if not user:
-                guidance = "Pass --user USER or set BANDCAMP_USER when downloading with --yes."
+            guidance = f"Run `bandcamp-plex-sync auth-check {user}` to diagnose access."
         else:
-            guidance = "Enable --cookies-from-browser to refresh them before downloading."
+            guidance = "Enable --cookies-from-browser to obtain protected download URLs."
         console.print(
             f"[yellow]{len(missing_redownload)} downloadable item(s) lack authenticated "
             f"download URLs.[/] {guidance}"
@@ -1356,7 +1347,7 @@ def download_missing(
         if item.get("redownload_url"):
             marker = "✓"
         elif bool(item.get("download_available")):
-            marker = "authenticated URL will be refreshed"
+            marker = "authenticated download URL unavailable"
         else:
             marker = "not individually downloadable"
         console.print(f"- {item['artist']} — {item['title']}  [dim]{marker}  {item['url']}[/]")
@@ -1367,10 +1358,13 @@ def download_missing(
         console.print("\nDry run only. Re-run with --yes to download files.")
         return
     if not with_redownload:
-        raise SystemExit(2)
+        if missing_redownload:
+            raise SystemExit(2)
+        console.print("\nNo individually downloadable missing items remain.")
+        return
 
-    session = session or configure_session(cookies_from_browser, user or None)
     downloaded_count = 0
+    completed_count = 0
     failed: list[tuple[dict[str, Any], str]] = []
     for item in with_redownload:
         try:
@@ -1383,76 +1377,25 @@ def download_missing(
                 keep_archives=keep_archives,
             )
             downloaded_count += len(downloaded)
+            completed_count += 1
+            record_completed_download(
+                report,
+                item,
+                downloaded,
+                destination=destination,
+                download_format=download_format,
+            )
+            persist_download_report(report_json, report)
         except Exception as exc:  # noqa: BLE001 - continue with the rest of the queue.
             failed.append((item, str(exc)))
             console.print(f"[red]Failed:[/] {item['artist']} — {item['title']}: {exc}")
 
-    console.print(f"\nDownloaded, extracted, or verified {downloaded_count} file(s).")
+    console.print(
+        f"\nCompleted {completed_count} item(s); downloaded, extracted, or verified "
+        f"{downloaded_count} file(s)."
+    )
     if failed:
         console.print(f"[red]{len(failed)} item(s) failed.[/]")
-
-
-def write_outputs(output_dir: Path, report: dict[str, Any]) -> None:
-    write_json(output_dir / "sync-report.json", report)
-    write_markdown_report(output_dir / "sync-report.md", report)
-    write_missing_urls(output_dir / "missing-urls.txt", report)
-    write_missing_csv(output_dir / "missing.csv", report)
-    console.print(f"\nReports written under {output_dir}")
-
-
-@app.command
-def audit(
-    user: str = "",
-    music_root: Path = DEFAULT_MUSIC_ROOT,
-    output_dir: Path = CACHE_DIR,
-    checkpoint_db: Path | None = None,
-    cookies_from_browser: bool = False,
-    include_hidden: bool = False,
-    threshold: float = 0.86,
-    limit: int | None = None,
-    max_files: int | None = None,
-    rescan_all: bool = False,
-) -> None:
-    """Fetch Bandcamp, scan Plex music, compare, and write reports."""
-    user = user or os.environ.get("BANDCAMP_USER", "")
-    if not user:
-        console.print("[red]Provide USER or set BANDCAMP_USER.[/]")
-        raise SystemExit(2)
-
-    console.print(f"Fetching Bandcamp collection for [bold]{user}[/]...")
-    collection = fetch_collection_items(
-        user,
-        cookies_from_browser=cookies_from_browser,
-        include_hidden=include_hidden,
-        limit=limit,
-    )
-    write_json(output_dir / "bandcamp-collection.json", collection)
-
-    console.print(f"Scanning local music under [bold]{music_root}[/]...")
-    checkpoint_db = checkpoint_db or output_dir / DEFAULT_CHECKPOINT_DB.name
-    music_scan = scan_music_tree(
-        music_root,
-        max_files=max_files,
-        checkpoint_db=checkpoint_db,
-        rescan_all=rescan_all,
-    )
-    local_scan = {
-        "scanned_at": now_iso(),
-        "root": str(music_root.expanduser().absolute()),
-        "checkpoint_db": str(checkpoint_db.expanduser().absolute()),
-        "scan_stats": asdict(music_scan.stats),
-        "tracks": [asdict(track) for track in music_scan.tracks],
-    }
-    write_json(output_dir / "local-scan.json", local_scan)
-    stats = music_scan.stats
-    console.print(
-        f"Music metadata: [green]{stats.metadata_reused} cached[/], "
-        f"[yellow]{stats.metadata_scanned} new or changed[/], {stats.removed} removed"
-    )
-
-    report = compare_payloads(collection, local_scan, threshold=threshold)
-    write_outputs(output_dir, report)
-    print_summary(report)
 
 
 def main() -> None:

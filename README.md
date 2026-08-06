@@ -53,95 +53,69 @@ metadata:
 
 ## Quick start
 
-Run an authenticated audit, then download missing FLAC albums/tracks:
+Fetch your Bandcamp collection, incrementally scan the local library, and download
+missing purchased music in one command:
 
 ```bash
-bandcamp-plex-sync audit YOUR_BANDCAMP_USERNAME --cookies-from-browser
-bandcamp-plex-sync download-missing --yes
+bandcamp-plex-sync sync --user YOUR_BANDCAMP_USERNAME --yes
 ```
 
-For the original use case:
+After the first run, the saved report supplies the username, so repeat runs are:
 
 ```bash
-bandcamp-plex-sync audit feoh --cookies-from-browser
-bandcamp-plex-sync download-missing --yes
+bandcamp-plex-sync sync --yes
 ```
 
 By default, files are written under `/nas/music`.
 
 ## Commands
 
-### `audit`
+### `sync`
 
-Fetches your Bandcamp collection, scans the local music directory, compares both,
-and writes reports.
+Every invocation fetches the current Bandcamp collection, incrementally scans the
+destination music library, compares the two, and writes fresh reports. It downloads
+missing purchased items when `--yes` is provided; without `--yes`, it is a dry run.
 
-```bash
-bandcamp-plex-sync audit USER --cookies-from-browser
-```
-
-Useful options:
-
-```bash
-bandcamp-plex-sync audit USER \
-  --music-root /nas/music \
-  --output-dir ~/.cache/bandcamp-plex-sync \
-  --cookies-from-browser \
-  --include-hidden
-```
-
-Outputs:
+Outputs are stored under `~/.cache/bandcamp-plex-sync/`:
 
 ```text
-~/.cache/bandcamp-plex-sync/
-  bandcamp-collection.json   # fetched Bandcamp collection metadata
-  local-scan.json            # scanned local audio metadata and incremental scan stats
-  music-scan.sqlite3         # persistent file signatures and cached tag metadata
-  sync-report.json           # machine-readable comparison
-  sync-report.md             # human-readable report
-  missing-urls.txt           # Bandcamp item pages for missing items
-  missing.csv                # spreadsheet-friendly missing item list
+bandcamp-collection.json   # fetched Bandcamp collection metadata
+local-scan.json            # scanned local audio metadata and incremental scan stats
+music-scan.sqlite3         # persistent file signatures and cached tag metadata
+sync-report.json           # machine-readable comparison and download progress
+sync-report.md             # human-readable report
+missing-urls.txt           # Bandcamp item pages for missing items
+missing.csv                # spreadsheet-friendly missing item list
 ```
 
-### `download-missing`
-
-Downloads missing purchased items from `sync-report.json`. When `--yes` is
-provided, the command uses the current browser session to refresh protected
-Bandcamp download URLs automatically; another audit is not required.
-
-```bash
-bandcamp-plex-sync download-missing --yes
-```
-
-Older or custom reports without `bandcamp_user` can provide it explicitly:
-
-```bash
-bandcamp-plex-sync download-missing --user USER --yes
-```
+The local tree is still walked to detect additions, changes, and deletions, but
+unchanged audio tags come from `music-scan.sqlite3` rather than being reread from
+every music file. Only new or changed files require metadata parsing after the
+initial scan.
 
 FLAC is the default:
 
 ```bash
-bandcamp-plex-sync download-missing --download-format flac --yes
+bandcamp-plex-sync sync --download-format flac --yes
 ```
 
 Safety/testing options:
 
 ```bash
 # Dry run; shows what would download
-bandcamp-plex-sync download-missing
+bandcamp-plex-sync sync
 
 # Test with one item
-bandcamp-plex-sync download-missing --limit 1 --yes
+bandcamp-plex-sync sync --limit 1 --yes
 
 # Write somewhere other than /nas/music
-bandcamp-plex-sync download-missing --destination ./downloads --yes
+bandcamp-plex-sync sync --destination ./downloads --yes
 
 # Keep Bandcamp ZIP archives after extraction
-bandcamp-plex-sync download-missing --keep-archives --yes
+bandcamp-plex-sync sync --keep-archives --yes
 
 # Replace existing files
-bandcamp-plex-sync download-missing --overwrite --yes
+bandcamp-plex-sync sync --overwrite --yes
 ```
 
 Downloaded album ZIPs are extracted into:
@@ -156,6 +130,13 @@ Single-track FLAC downloads are written similarly:
 /nas/music/Artist/Track Title/Artist - Track Title.flac
 ```
 
+After every successfully downloaded or verified item, `sync` immediately moves that
+item from `missing` to `completed` in `sync-report.json`, records its file paths, and
+updates the Markdown, URL, and CSV reports. Interrupted runs therefore resume with
+only unfinished items. The next invocation starts with another fresh, incremental
+comparison, so files downloaded earlier are recognized locally before Bandcamp
+download pages are opened.
+
 ### `auth-check`
 
 Verify that one of the supported browser profiles is logged in to the account
@@ -169,59 +150,29 @@ bandcamp-plex-sync auth-check USER
 This is a diagnostic check only. It does not create a persistent login or store
 browser cookies.
 
-### `fetch`
+#### Incremental scanning
 
-Only fetch Bandcamp metadata:
-
-```bash
-bandcamp-plex-sync fetch USER --cookies-from-browser
-```
-
-### `scan`
-
-Incrementally scan local music metadata:
-
-```bash
-bandcamp-plex-sync scan --music-root /nas/music
-```
-
-The first run reads tags from every audio file and records the file size,
+The first `sync` run reads tags from every audio file and records the file size,
 nanosecond modification/change times, device, and inode in
 `~/.cache/bandcamp-plex-sync/music-scan.sqlite3`. Later runs still walk the
-filesystem to detect additions, modifications, renames, and deletions, but they
-reuse cached tags for unchanged files instead of opening and parsing every audio
-file. This makes repeat scans much faster while retaining change detection.
-
-The `scan` and `audit` commands both support:
+filesystem to detect additions, modifications, renames, and deletions, but reuse
+cached tags for unchanged files instead of opening and parsing every audio file.
 
 ```bash
 # Put the checkpoint database somewhere else
-bandcamp-plex-sync scan --checkpoint-db /path/to/music-checkpoints.sqlite3
+bandcamp-plex-sync sync --checkpoint-db /path/to/music-checkpoints.sqlite3 --yes
 
 # Ignore cached signatures and refresh every track's metadata
-bandcamp-plex-sync scan --rescan-all
-```
-
-When `--output` or `--output-dir` is changed without an explicit
-`--checkpoint-db`, the database is placed alongside the JSON output.
-
-### `compare`
-
-Compare previously fetched/scanned JSON files:
-
-```bash
-bandcamp-plex-sync compare
+bandcamp-plex-sync sync --rescan-all --yes
 ```
 
 ## Authentication and browser cookies
 
-Use `--cookies-from-browser` with `fetch` or `audit` when you want purchased
-download URLs. `download-missing` uses browser authentication by default because
-it refreshes and opens Bandcamp's protected download pages itself. Authentication
-is command-scoped; no login session is persisted between invocations.
+`sync` uses browser authentication by default because Bandcamp's purchased-download
+pages are protected. Authentication is command-scoped; no login session is persisted
+between invocations.
 
-Use `auth-check USER` to diagnose authentication independently before running an
-audit or download.
+Use `auth-check USER` to diagnose authentication independently before running `sync`.
 
 Every discovered profile in each supported browser is checked, rather than only
 the browser's default profile. The tool verifies that the selected session owns
@@ -251,8 +202,8 @@ Their album and track releases appear as separate downloadable collection items.
 
 ## Matching behavior
 
-The audit compares normalized artist, album, and track metadata. It uses local
-audio tags when present and falls back to Plex-style paths:
+`sync` compares normalized artist, album, and track metadata. It uses local audio
+tags when present and falls back to Plex-style paths:
 
 ```text
 Artist/Album/Track.ext
@@ -267,7 +218,7 @@ The report distinguishes:
 You can tune fuzzy matching with:
 
 ```bash
-bandcamp-plex-sync audit USER --threshold 0.90
+bandcamp-plex-sync sync --threshold 0.90 --yes
 ```
 
 Higher thresholds produce fewer possible matches.
@@ -281,7 +232,7 @@ Higher thresholds produce fewer possible matches.
 - Existing music is skipped by default.
 - The local SQLite checkpoint database contains file paths and music tags, but
   no Bandcamp credentials or browser cookies.
-- Nothing is downloaded unless `download-missing --yes` is used.
+- Nothing is downloaded unless `sync --yes` is used.
 - Nothing is deleted from your Plex library.
 
 ## Development
